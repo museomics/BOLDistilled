@@ -47,38 +47,57 @@ merged <- rbind(boldlist_w_bins, df)
 
 get_bin_consensus <- function(
     df,
-    ranks=c("kingdom", "phylum", "class", "order", "family", "subfamily", "tribe", "genus", "species", "subspecies"),
-    threshold=0.75,
-    enforce_scientific=TRUE,
-    groups="bin") {
-  
-  # Regex pattern to recognize non-scientific names in BOLD
-  re_int <- paste0(
-    "\\.\\Z",                                   # trailing period
-    "|\\S{2,}\\.\\S",                           # internal dot between non-whitespace strings
-    "|[0-9]",                                   # any digit
-    "|\\s[A-Z]",                                # space followed by capital letter
-    "|[A-Z]\\Z",                                # capital letter at end
-    "|[A-Z]{2}",                                # two consecutive capitals
-    "|[a-z][A-Z]",                              # lowercase followed by uppercase
-    "|_(?!(hn|sl|ss)\\Z)",                       # underscore, unless used to designate a homonym or sense
-    "|%",                                       # percent
-    "|\\(",                                     # open parenthesis
-    "|\\)",                                     # close parenthesis
-    "|,",                                       # comma
-    "|\\s(?:aff|agg|cf|complex|group|grp|gr|gp|cmplx|pr|ms|cfr|nr|nsp|near|nomen|hybrid|voucher|form|from|ss|ssl|see|spp?|sample)\\.?(?:\\s|\\Z)" 
-  )
-  
+    ranks = c("kingdom", "phylum", "class", "order", "family", "subfamily", "tribe", "genus", "species", "subspecies"),
+    threshold = 1.0,
+    min_ids = 2,
+    enforce_scientific = TRUE,
+    groups = "bin_uri",
+    discord_format = c("list", "text")) {
+
+  stopifnot("One or more provided `ranks` is/are missing from `df`." = all(ranks %in% names(df)),
+            "Provided `groups` column is missing from `df`." = (groups %in% names(df)),
+            "`threshold` value(s) must be one or more real numbers (i.e. doubles) between 0 and 1." = is.double(unlist(threshold)) & all(unlist(threshold) >= 0) & all(unlist(threshold) <= 1),
+            "`threshold` must be either a single number, a vector of unnamed numbers equal in length to `ranks`, or a named list or vector of numbers with names corresponding to ranks." = ((length(threshold) == 1) | (length(threshold) == length(ranks)) | (!is.null(names(threshold)))),
+            "`min_ids` value(s) must be one or more whole numbers greater than zero." = is.numeric(unlist(min_ids)) & all(unlist(min_ids) > 0) & all(unlist(min_ids) %% 1 == 0),
+            "`min_ids` must be either a single number, a vector of unnamed numbers equal in length to `ranks`, or a named list or vector of numbers with names corresponding to ranks." = ((length(min_ids) == 1) | (length(min_ids) == length(ranks)) | (!is.null(names(min_ids)))),
+            '`discord_format` must be one of "list" or "text".' = all(discord_format %in% c("list", "text")))
+
+  # Parse threshold & min_ids parameters and align them with ranks
+  parse_param_vector <- function(param) {
+    if((length(param) != 1) | !is.null(names(param))) {
+      if(is.null(names(param))) {
+        param <- unlist(unname(param))
+      } else {
+        named <- as.list(param[(names(param) %in% ranks) & (!duplicated(param))])
+        default <- ifelse("default" %in% names(param), param[["default"]], max(unlist(param)))
+        if((!length(named) %in% c(0, length(ranks))) & (!"default" %in% names(param))) {
+          warning(paste0("Only some ranks found among `",substitute(param),"` values, with no default given; highest value applied to all unspecified ranks."))
+        }
+        param <- rep(default, length(ranks))
+        for(r in names(named)) param[match(r, ranks)] <- named[[r]]
+      }
+    } else {
+      param <- rep(unlist(param), length(ranks))
+    }
+    return(param)
+  }
+
+  threshold <- parse_param_vector(threshold)
+  min_ids <- parse_param_vector(min_ids)
+
+  # Create a copy of the data to avoid mutating by reference
+  dt <- as.data.table(copy(df))
+
   # Replace NA in taxonomy columns with empty values (if ignoring non-scientific names, replace those too)
   if(enforce_scientific) {
-    df[, (c(ranks)) := lapply(.SD, function(x) fifelse(is.na(x), "", fifelse(grepl(re_int, x, perl = TRUE), "", as.character(x)))), .SDcols = c(ranks)]
+    dt[, (c(ranks)) := lapply(.SD, function(x) data.table::fifelse(is.na(x), "", data.table::fifelse(grepl(.PKG_ENV$RE_INT, x, perl = TRUE), "", as.character(x)))), .SDcols = c(ranks)]
   } else {
-    df[, (c(ranks)) := lapply(.SD, function(x) fifelse(is.na(x), "", as.character(x))), .SDcols = c(ranks)]
+    dt[, (c(ranks)) := lapply(.SD, function(x) data.table::fifelse(is.na(x), "", as.character(x))), .SDcols = c(ranks)]
   }
-  
+
   # Convert data table to matrix for faster row access
-  mat <- as.matrix(df[, .SD, .SDcols = c(groups, ranks)])
-  
+  mat <- as.matrix(dt[, c(groups,ranks), with = FALSE])
+
   # Replace trailing "" with NA so that they are not counted as alternative names
   for (i in seq_len(nrow(mat))) {
     row_vals <- mat[i, ]
@@ -92,79 +111,111 @@ get_bin_consensus <- function(
       mat[i, ] <- NA_character_  # Entire row is blank
     }
   }
-  
+
   # Convert back to data.table and restore column names
   dt <- as.data.table(mat)
   setnames(dt, c(groups,ranks))
+
+  # Core consensus logic
+  get_consistent_taxon <- function(sub_dt,
+                                   ranks = c("kingdom", "phylum", "class", "order", "family", "subfamily", "tribe", "genus", "species", "subspecies"),
+                                   threshold = 1.0,
+                                   min_ids = 2) {
   
-  # Function to compute the consensus taxon for each group
-  get_consistent_taxon <- function(sub_dt, ranks, threshold) {
-    
     id_hier <- sapply(ranks,function(x) NULL)
     concordant = FALSE
     rank_set <- ranks
-    
+  
+    # Ensure min_ids does not exceed group size
+    if (any(min_ids > nrow(sub_dt))) {
+      for(i in seq_along(min_ids)) min_ids[[i]] <- nrow(sub_dt)
+    }
+  
+    # Expand threshold and min_ids parameters into full vectors if applicable
+    if (length(threshold) == 1) { threshold <- rep(threshold, length(ranks)) }
+    if (length(min_ids) == 1) { min_ids <- rep(min_ids, length(ranks)) }
+  
     result <- list(
       member_count = nrow(sub_dt),
       concordant_rank = NA_character_,
       concordant_id = NA_character_,
+      concordant_id_count = 0L,
       discordant_rank = NA_character_,
-      discordant_ids = list()
+      discordant_ids = list(),
+      discordant_id_count = 0L
     )
-    
+  
     for (rank_col in rev(ranks)) {  # Step backwards through ranks
-      
+  
+      rank_threshold <- threshold[which(ranks==rank_col)]
+      rank_min_ids <- min_ids[which(ranks==rank_col)]
       vals <- sub_dt[[rank_col]]
-      filtered <- vals[!is.na(vals)]
-      name_vals <- proportions(table(filtered))
-      props <- name_vals[name_vals >= threshold]
+      filtered <- table(vals[!is.na(vals)])
+      name_vals <- proportions(filtered)
+      props <- proportions(filtered)[(proportions(filtered) >= rank_threshold) & (filtered >= rank_min_ids)]
       names(name_vals) <- sub("^$","<None>",names(name_vals))
-      
+  
       if ((length(props) != 1) & (length(unique(filtered)) > 0)) {
-        
+  
         concordant <- FALSE
-        
+  
         if(id_hier[rank_col] != "") {
-          rank_set <- ranks[0:(which(ranks==rank_col)-1)] 
+          rank_set <- ranks[0:(which(ranks==rank_col)-1)]
           id_hier <- id_hier[rank_set]
         }
-        
+  
         result$discordant_rank <- rank_col
-        result$discordant_ids <- list(setNames(as.vector(name_vals), names(name_vals)))
-        
-      } else if ((length(props) == 1)) {
-        
+        result$discordant_ids <- list(stats::setNames(as.vector(name_vals), names(name_vals)))
+        result$discordant_id_count <- sum(filtered)
+  
+      } else if ((length(props) == 1) && (names(props)[1] != "")) {
+  
         if(!concordant) {
           result$concordant_rank <- rank_col
           result$concordant_id <- names(props)[1]
+          result$concordant_id_count <- unname(filtered[names(props)[1]])
         }
-        
+  
         concordant <- TRUE
-        
-        if ((names(props)[1] != id_hier[rank_col])) {
+  
+        if (is.null(id_hier[[rank_col]]) || is.na(id_hier[[rank_col]]) || is.na(names(props)[1]) || (names(props)[1] != id_hier[[rank_col]])) {
           rank_set <- ranks[0:which(ranks==rank_col)]
-          id_hier <- as.list(sub_dt[get(rank_col) == names(props)[1],..rank_set][1])
+          id_hier <- as.list(sub_dt[get(rank_col) == names(props)[1], .SD, .SDcols = rank_set][1])
         }
-        
+  
       }
     }
-    
+  
     for (r in setdiff(ranks,names(id_hier))) {
       id_hier[r] = NA_character_
     }
-    
+  
     result[ranks] <- id_hier
-    
+  
     return(result)
   }
-  
-  # Generate and return summary of consensus by BIN
-  dt[, get_consistent_taxon(.SD, ..ranks, ..threshold), by = eval(groups)]
-  
+                      
+  # Generate summary of consensus by BIN
+  consensus <- dt[!is.na(get(groups)), do.call(get_consistent_taxon, list(.SD, ranks, threshold, min_ids)), by = groups, .SDcols = ranks]
+
+  # Convert discordant_ids to text if appropriate
+  if(discord_format[1] == "text"){
+    data.table::set(consensus,
+                    j = "discordant_ids",
+                    value = sapply(consensus[["discordant_ids"]], function(x) {
+                      if (length(x) == 0) return("")
+                      sort(x, decreasing = TRUE)
+                      pairs <- paste0(names(x), " (", formatC(as.numeric(x), format = "f", digits = 2), ")")
+                      paste(pairs, collapse = ", ")
+                      })
+                    )
+  }
+
+  return(consensus)
+
 }
 
-df_summary <- get_bin_consensus(merged)
-
+df_summary <- get_bin_consensus(merged, threshold = list(default = 0.75, species = 0.95, subspecies = 0.95), min_ids = 1, groups = "bin")
 
 #####################################################################################################################################
 # import new and previous FASTA file 
