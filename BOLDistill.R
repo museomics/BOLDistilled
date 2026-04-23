@@ -62,6 +62,9 @@ get_bin_consensus <- function(
             "`min_ids` must be either a single number, a vector of unnamed numbers equal in length to `ranks`, or a named list or vector of numbers with names corresponding to ranks." = ((length(min_ids) == 1) | (length(min_ids) == length(ranks)) | (!is.null(names(min_ids)))),
             '`discord_format` must be one of "list" or "text".' = all(discord_format %in% c("list", "text")))
 
+  # Define regex for non-scientific names
+  re_int <- "\\.\\Z|\\S{2,}\\.\\S|[0-9]|\\s[A-Z]|[A-Z]\\Z|[A-Z]{2}|[a-z][A-Z]|_(?!(hn|sl|ss)\\Z)|%|\\?|!|\\[|\\]|\\{|\\}|\\(|\\)|,|\\s(?:aff|agg|cf|complex|group|grp|gr|gp|cmplx|pr|ms|cfr|nr|nsp|near|nomen|hybrid|voucher|form|from|ss|ssl|see|spp?|sample)\\.?(?:\\s|\\Z)"
+  
   # Parse threshold & min_ids parameters and align them with ranks
   parse_param_vector <- function(param) {
     if((length(param) != 1) | !is.null(names(param))) {
@@ -90,7 +93,7 @@ get_bin_consensus <- function(
 
   # Replace NA in taxonomy columns with empty values (if ignoring non-scientific names, replace those too)
   if(enforce_scientific) {
-    dt[, (c(ranks)) := lapply(.SD, function(x) data.table::fifelse(is.na(x), "", data.table::fifelse(grepl(.PKG_ENV$RE_INT, x, perl = TRUE), "", as.character(x)))), .SDcols = c(ranks)]
+    dt[, (c(ranks)) := lapply(.SD, function(x) data.table::fifelse(is.na(x), "", data.table::fifelse(grepl(re_int, x, perl = TRUE), "", as.character(x)))), .SDcols = c(ranks)]
   } else {
     dt[, (c(ranks)) := lapply(.SD, function(x) data.table::fifelse(is.na(x), "", as.character(x))), .SDcols = c(ranks)]
   }
