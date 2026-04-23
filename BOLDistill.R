@@ -90,13 +90,12 @@ get_bin_consensus <- function(
 
   # Create a copy of the data to avoid mutating by reference
   dt <- as.data.table(copy(df))
-
+  
   # Replace NA in taxonomy columns with empty values (if ignoring non-scientific names, replace those too)
-  if(enforce_scientific) {
-    dt[, (c(ranks)) := lapply(.SD, function(x) data.table::fifelse(is.na(x), "", data.table::fifelse(grepl(re_int, x, perl = TRUE), "", as.character(x)))), .SDcols = c(ranks)]
-  } else {
-    dt[, (c(ranks)) := lapply(.SD, function(x) data.table::fifelse(is.na(x), "", as.character(x))), .SDcols = c(ranks)]
-  }
+  dt[, (ranks) := lapply(.SD, function(x) data.table::fcase(enforce_scientific & grepl(re_int, x, perl = TRUE), "",
+                                                            is.na(x), "",
+                                                            grepl("^\\s$", x), "",
+                                                            default = as.character(x))), .SDcols = ranks]
 
   # Convert data table to matrix for faster row access
   mat <- as.matrix(dt[, c(groups,ranks), with = FALSE])
@@ -120,11 +119,8 @@ get_bin_consensus <- function(
   setnames(dt, c(groups,ranks))
 
   # Core consensus logic
-  get_consistent_taxon <- function(sub_dt,
-                                   ranks = c("kingdom", "phylum", "class", "order", "family", "subfamily", "tribe", "genus", "species", "subspecies"),
-                                   threshold = 1.0,
-                                   min_ids = 2) {
-  
+  get_consistent_taxon <- function(sub_dt, ranks, threshold, min_ids) {
+    
     id_hier <- sapply(ranks,function(x) NULL)
     concordant = FALSE
     rank_set <- ranks
@@ -166,10 +162,12 @@ get_bin_consensus <- function(
           rank_set <- ranks[0:(which(ranks==rank_col)-1)]
           id_hier <- id_hier[rank_set]
         }
-  
-        result$discordant_rank <- rank_col
-        result$discordant_ids <- list(stats::setNames(as.vector(name_vals), names(name_vals)))
-        result$discordant_id_count <- sum(filtered)
+
+        if(length(name_vals) > 1) {
+          result$discordant_rank <- rank_col
+          result$discordant_ids <- list(stats::setNames(as.vector(name_vals), names(name_vals)))
+          result$discordant_id_count <- sum(filtered)
+        }
   
       } else if ((length(props) == 1) && (names(props)[1] != "")) {
   
