@@ -8,6 +8,8 @@ library(Biostrings)
 library(ggplot2)
 library(tidyr)
 library(patchwork)
+library(DBI)
+library(duckdb)
 
 
 # get argument from bash script
@@ -16,16 +18,11 @@ fasta_file <- args[1]
 wd <- args[2]
 setwd(wd)
 
-# import curated BOLD List
-input <- fread("combined_boldlist.tsv", header = T, sep = "\t", fill = TRUE)
+# taxonomy columns required for the consensus step (everything else is ignored)
+TAX_COLS <- c("bin", "kingdom", "phylum", "class", "order", "family",
+              "subfamily", "tribe", "genus", "species", "subspecies")
 
-# remove unwanted columns
-df <- input[,c("bin", "kingdom", "phylum", "class", "order", "family", "subfamily", "tribe", "genus", "species", "subspecies")]
-
-# remove BINs (these will be curated from original input boldlist)
-df <- df[!grepl("BOLD:", df$bin),]
-
-# import original boldlist
+# locate the original boldlist
 input_files <- list.files(pattern = "^boldlist_INPUT_.*\\.tsv$")
 if (length(input_files) > 0) {
   boldlist_file <- input_files[1]
@@ -34,11 +31,34 @@ if (length(input_files) > 0) {
 } else {
   stop("No boldlist input file found.")
 }
-boldlist <- fread(boldlist_file, header = TRUE, sep = "\t", fill = TRUE)
 
-# reduce boldlist to only records with BINs and remove unwanted columns
-boldlist_w_bins <- boldlist[grepl("BOLD:", boldlist$bin),]
-boldlist_w_bins <- boldlist_w_bins[,c("bin", "kingdom", "phylum", "class", "order", "family", "subfamily", "tribe", "genus", "species", "subspecies")]
+# Read the two large tables with DuckDB rather than fread.
+# combined_boldlist.tsv and the boldlist are tens of GB and are dominated by the 'nuc' sequence
+# column, which this script never uses. fread pulled every column and every row into RAM (~30 GB)
+# and the process was OOM-killed. DuckDB scans the files on disk and materialises only the
+# taxonomy columns and the rows actually needed, which is a small fraction of the data.
+con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+on.exit(try(dbDisconnect(con, shutdown = TRUE), silent = TRUE), add = TRUE)
+dbExecute(con, paste0("PRAGMA threads=", max(1, parallel::detectCores() - 2)))
+dbExecute(con, "PRAGMA memory_limit='8GB'")
+if (dir.exists(file.path(wd, ".tmp"))) {
+  dbExecute(con, sprintf("PRAGMA temp_directory='%s'", file.path(wd, ".tmp")))
+}
+
+tax_cols_sql <- paste(sprintf('"%s"', TAX_COLS), collapse = ", ")
+read_tsv_sql <- function(path) {
+  sprintf("read_csv('%s', header=true, delim='\t', all_varchar=true)", path)
+}
+
+# OTU rows from the combined list (BIN rows are curated from the original boldlist below)
+df <- setDT(dbGetQuery(con, sprintf(
+  "SELECT %s FROM %s WHERE bin IS NOT NULL AND bin NOT LIKE '%%BOLD:%%'",
+  tax_cols_sql, read_tsv_sql("combined_boldlist.tsv"))))
+
+# reduce boldlist to only records with BINs, taxonomy columns only
+boldlist_w_bins <- setDT(dbGetQuery(con, sprintf(
+  "SELECT %s FROM %s WHERE bin LIKE '%%BOLD:%%'",
+  tax_cols_sql, read_tsv_sql(boldlist_file))))
 
 # merge OTUs and BINs into one table
 merged <- rbind(boldlist_w_bins, df)
@@ -47,59 +67,38 @@ merged <- rbind(boldlist_w_bins, df)
 
 get_bin_consensus <- function(
     df,
-    ranks = c("kingdom", "phylum", "class", "order", "family", "subfamily", "tribe", "genus", "species", "subspecies"),
-    threshold = 1.0,
-    min_ids = 2,
-    enforce_scientific = TRUE,
-    groups = "bin_uri",
-    discord_format = c("list", "text")) {
-
-  stopifnot("One or more provided `ranks` is/are missing from `df`." = all(ranks %in% names(df)),
-            "Provided `groups` column is missing from `df`." = (groups %in% names(df)),
-            "`threshold` value(s) must be one or more real numbers (i.e. doubles) between 0 and 1." = is.double(unlist(threshold)) & all(unlist(threshold) >= 0) & all(unlist(threshold) <= 1),
-            "`threshold` must be either a single number, a vector of unnamed numbers equal in length to `ranks`, or a named list or vector of numbers with names corresponding to ranks." = ((length(threshold) == 1) | (length(threshold) == length(ranks)) | (!is.null(names(threshold)))),
-            "`min_ids` value(s) must be one or more whole numbers greater than zero." = is.numeric(unlist(min_ids)) & all(unlist(min_ids) > 0) & all(unlist(min_ids) %% 1 == 0),
-            "`min_ids` must be either a single number, a vector of unnamed numbers equal in length to `ranks`, or a named list or vector of numbers with names corresponding to ranks." = ((length(min_ids) == 1) | (length(min_ids) == length(ranks)) | (!is.null(names(min_ids)))),
-            '`discord_format` must be one of "list" or "text".' = all(discord_format %in% c("list", "text")))
-
-  # Define regex for non-scientific names
-  re_int <- "\\.\\Z|\\S{2,}\\.\\S|[0-9]|\\s[A-Z]|[A-Z]\\Z|[A-Z]{2}|[a-z][A-Z]|_(?!(hn|sl|ss)\\Z)|%|\\?|!|\\[|\\]|\\{|\\}|\\(|\\)|,|\\s(?:aff|agg|cf|complex|group|grp|gr|gp|cmplx|pr|ms|cfr|nr|nsp|near|nomen|hybrid|voucher|form|from|ss|ssl|see|spp?|sample)\\.?(?:\\s|\\Z)"
+    ranks=c("kingdom", "phylum", "class", "order", "family", "subfamily", "tribe", "genus", "species", "subspecies"),
+    threshold=0.75,
+    enforce_scientific=TRUE,
+    groups="bin") {
   
-  # Parse threshold & min_ids parameters and align them with ranks
-  parse_param_vector <- function(param) {
-    if((length(param) != 1) | !is.null(names(param))) {
-      if(is.null(names(param))) {
-        param <- unlist(unname(param))
-      } else {
-        named <- as.list(param[(names(param) %in% ranks) & (!duplicated(param))])
-        default <- ifelse("default" %in% names(param), param[["default"]], max(unlist(param)))
-        if((!length(named) %in% c(0, length(ranks))) & (!"default" %in% names(param))) {
-          warning(paste0("Only some ranks found among `",substitute(param),"` values, with no default given; highest value applied to all unspecified ranks."))
-        }
-        param <- rep(default, length(ranks))
-        for(r in names(named)) param[match(r, ranks)] <- named[[r]]
-      }
-    } else {
-      param <- rep(unlist(param), length(ranks))
-    }
-    return(param)
-  }
-
-  threshold <- parse_param_vector(threshold)
-  min_ids <- parse_param_vector(min_ids)
-
-  # Create a copy of the data to avoid mutating by reference
-  dt <- as.data.table(copy(df))
+  # Regex pattern to recognize non-scientific names in BOLD
+  re_int <- paste0(
+    "\\.\\Z",                                   # trailing period
+    "|\\S{2,}\\.\\S",                           # internal dot between non-whitespace strings
+    "|[0-9]",                                   # any digit
+    "|\\s[A-Z]",                                # space followed by capital letter
+    "|[A-Z]\\Z",                                # capital letter at end
+    "|[A-Z]{2}",                                # two consecutive capitals
+    "|[a-z][A-Z]",                              # lowercase followed by uppercase
+    "|_(?!(hn|sl|ss)\\Z)",                       # underscore, unless used to designate a homonym or sense
+    "|%",                                       # percent
+    "|\\(",                                     # open parenthesis
+    "|\\)",                                     # close parenthesis
+    "|,",                                       # comma
+    "|\\s(?:aff|agg|cf|complex|group|grp|gr|gp|cmplx|pr|ms|cfr|nr|nsp|near|nomen|hybrid|voucher|form|from|ss|ssl|see|spp?|sample)\\.?(?:\\s|\\Z)" 
+  )
   
   # Replace NA in taxonomy columns with empty values (if ignoring non-scientific names, replace those too)
-  dt[, (ranks) := lapply(.SD, function(x) data.table::fcase(enforce_scientific & grepl(re_int, x, perl = TRUE), "",
-                                                            is.na(x), "",
-                                                            grepl("^\\s$", x), "",
-                                                            default = as.character(x))), .SDcols = ranks]
-
+  if(enforce_scientific) {
+    df[, (c(ranks)) := lapply(.SD, function(x) fifelse(is.na(x), "", fifelse(grepl(re_int, x, perl = TRUE), "", as.character(x)))), .SDcols = c(ranks)]
+  } else {
+    df[, (c(ranks)) := lapply(.SD, function(x) fifelse(is.na(x), "", as.character(x))), .SDcols = c(ranks)]
+  }
+  
   # Convert data table to matrix for faster row access
-  mat <- as.matrix(dt[, c(groups,ranks), with = FALSE])
-
+  mat <- as.matrix(df[, .SD, .SDcols = c(groups, ranks)])
+  
   # Replace trailing "" with NA so that they are not counted as alternative names
   for (i in seq_len(nrow(mat))) {
     row_vals <- mat[i, ]
@@ -113,138 +112,99 @@ get_bin_consensus <- function(
       mat[i, ] <- NA_character_  # Entire row is blank
     }
   }
-
+  
   # Convert back to data.table and restore column names
   dt <- as.data.table(mat)
   setnames(dt, c(groups,ranks))
-
-  # Core consensus logic
-  get_consistent_taxon <- function(sub_dt, ranks, threshold, min_ids) {
+  
+  # Function to compute the consensus taxon for each group
+  get_consistent_taxon <- function(sub_dt, ranks, threshold) {
     
     id_hier <- sapply(ranks,function(x) NULL)
     concordant = FALSE
     rank_set <- ranks
-  
-    # Ensure min_ids does not exceed group size
-    if (any(min_ids > nrow(sub_dt))) {
-      for(i in seq_along(min_ids)) min_ids[[i]] <- nrow(sub_dt)
-    }
-  
-    # Expand threshold and min_ids parameters into full vectors if applicable
-    if (length(threshold) == 1) { threshold <- rep(threshold, length(ranks)) }
-    if (length(min_ids) == 1) { min_ids <- rep(min_ids, length(ranks)) }
-  
+    
     result <- list(
       member_count = nrow(sub_dt),
       concordant_rank = NA_character_,
       concordant_id = NA_character_,
-      concordant_id_count = 0L,
       discordant_rank = NA_character_,
-      discordant_ids = list(),
-      discordant_id_count = 0L
+      discordant_ids = list()
     )
-  
+    
     for (rank_col in rev(ranks)) {  # Step backwards through ranks
-  
-      rank_threshold <- threshold[which(ranks==rank_col)]
-      rank_min_ids <- min_ids[which(ranks==rank_col)]
+      
       vals <- sub_dt[[rank_col]]
-      filtered <- table(vals[!is.na(vals)])
-      name_vals <- proportions(filtered)
-      props <- proportions(filtered)[(proportions(filtered) >= rank_threshold) & (filtered >= rank_min_ids)]
+      filtered <- vals[!is.na(vals)]
+      name_vals <- proportions(table(filtered))
+      props <- name_vals[name_vals >= threshold]
       names(name_vals) <- sub("^$","<None>",names(name_vals))
-  
+      
       if ((length(props) != 1) & (length(unique(filtered)) > 0)) {
-  
+        
         concordant <- FALSE
-  
+        
         if(id_hier[rank_col] != "") {
-          rank_set <- ranks[0:(which(ranks==rank_col)-1)]
+          rank_set <- ranks[0:(which(ranks==rank_col)-1)] 
           id_hier <- id_hier[rank_set]
         }
-
-        if(length(name_vals) > 1) {
-          result$discordant_rank <- rank_col
-          result$discordant_ids <- list(stats::setNames(as.vector(name_vals), names(name_vals)))
-          result$discordant_id_count <- sum(filtered)
-        }
-  
-      } else if ((length(props) == 1) && (names(props)[1] != "")) {
-  
+        
+        result$discordant_rank <- rank_col
+        result$discordant_ids <- list(setNames(as.vector(name_vals), names(name_vals)))
+        
+      } else if ((length(props) == 1)) {
+        
         if(!concordant) {
           result$concordant_rank <- rank_col
           result$concordant_id <- names(props)[1]
-          result$concordant_id_count <- unname(filtered[names(props)[1]])
         }
-  
+        
         concordant <- TRUE
-  
-        if (is.null(id_hier[[rank_col]]) || is.na(id_hier[[rank_col]]) || is.na(names(props)[1]) || (names(props)[1] != id_hier[[rank_col]])) {
+        
+        if ((names(props)[1] != id_hier[rank_col])) {
           rank_set <- ranks[0:which(ranks==rank_col)]
-          id_hier <- as.list(sub_dt[get(rank_col) == names(props)[1], .SD, .SDcols = rank_set][1])
+          id_hier <- as.list(sub_dt[get(rank_col) == names(props)[1],..rank_set][1])
         }
-  
+        
       }
     }
-  
+    
     for (r in setdiff(ranks,names(id_hier))) {
       id_hier[r] = NA_character_
     }
-  
+    
     result[ranks] <- id_hier
-  
+    
     return(result)
   }
-                      
-  # Generate summary of consensus by BIN
-  consensus <- dt[!is.na(get(groups)), do.call(get_consistent_taxon, list(.SD, ranks, threshold, min_ids)), by = groups, .SDcols = ranks]
-
-  # Convert discordant_ids to text if appropriate
-  if(discord_format[1] == "text"){
-    data.table::set(consensus,
-                    j = "discordant_ids",
-                    value = sapply(consensus[["discordant_ids"]], function(x) {
-                      if (length(x) == 0) return("")
-                      sort(x, decreasing = TRUE)
-                      pairs <- paste0(names(x), " (", formatC(as.numeric(x), format = "f", digits = 2), ")")
-                      paste(pairs, collapse = ", ")
-                      })
-                    )
-  }
-
-  return(consensus)
-
+  
+  # Generate and return summary of consensus by BIN
+  dt[, get_consistent_taxon(.SD, ..ranks, ..threshold), by = eval(groups)]
+  
 }
 
-df_summary <- get_bin_consensus(merged, threshold = list(default = 0.75, species = 0.95, subspecies = 0.95), min_ids = 1, groups = "bin")
+df_summary <- get_bin_consensus(merged)
+
 
 #####################################################################################################################################
-# import new and previous FASTA file 
-input.new.fasta <-readDNAStringSet(fasta_file)
-input.previous.fasta <- readDNAStringSet("previous_sequences_to_keep.fasta")
-
-# convert previous private record back to PID
-previous_private_map <- fread("previous_privatemap_to_keep.tsv", header = T, sep = "\t", fill = TRUE)
-lookup <- setNames(previous_private_map$processid, previous_private_map$new_processid)
-
-# revert any anonymized private_record_XXX names in the previous FASTA
-previous_names <- names(input.previous.fasta)
-prev_ids <- sapply(strsplit(previous_names, "\\|"), "[", 1)
-reverted_ids <- ifelse(prev_ids %in% names(lookup),
-                       lookup[prev_ids],
-                       prev_ids)
-bin_parts_prev <- sapply(strsplit(previous_names, "\\|"), "[", 2)
-names(input.previous.fasta) <- paste0(reverted_ids, "|", bin_parts_prev)
-
-input.fasta <- c(input.previous.fasta, input.new.fasta)
+# import new FASTA file (full distillation from scratch — no sequences carried forward)
+input.fasta <- readDNAStringSet(fasta_file)
 
 # make master taxonomy table that includes PIDs
 df.final <- data.frame("processid" = sapply(strsplit(names(input.fasta), "\\|"), "[", 1),
                        "bin" = sapply(strsplit(names(input.fasta), "\\|"), "[", 2))
-df.final$processid <- ifelse(df.final$processid %in% names(lookup), lookup[df.final$processid], df.final$processid)
 
-# add BOLDPUBLIC to master table
-df.final <- merge(df.final, boldlist[,c("processid", "BOLDPUBLIC")], by = "processid", all.x = TRUE)
+# add BOLDPUBLIC to master table — joined inside DuckDB against only the processids present in
+# the FASTA, so the full boldlist is never materialised in R
+duckdb::duckdb_register(con, "fasta_pids",
+                        data.frame(processid = unique(df.final$processid),
+                                   stringsAsFactors = FALSE))
+pub_map <- dbGetQuery(con, sprintf(
+  "SELECT DISTINCT TRIM(b.processid) AS processid, b.BOLDPUBLIC
+     FROM %s b
+     JOIN fasta_pids f ON TRIM(b.processid) = TRIM(f.processid)",
+  read_tsv_sql(boldlist_file)))
+df.final <- merge(df.final, pub_map, by = "processid", all.x = TRUE)
 
 # add curated taxonomy to master table based on BIN/OTU name
 df.final <- merge(df.final, df_summary, by = "bin", all.x = TRUE)

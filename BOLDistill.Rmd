@@ -11,6 +11,7 @@ params:
   count: ""
   bin_count: ""
   bin_inel_count: ""
+  redundant_otu_count: ""
 geometry: margin=1in
 fontsize: 11pt
 header-includes:
@@ -29,7 +30,7 @@ header-includes:
 
 ```{r setup, include=FALSE, warning=FALSE, message=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-# v1.4 (July 2025)
+# v1.1
 
 # extract parameters
 wd <- params$wd
@@ -39,6 +40,8 @@ threshold <- params$threshold
 count <- as.numeric(params$count)
 bin_count <- as.numeric(params$bin_count)
 bin_inel_count <- as.numeric(params$bin_inel_count)
+redundant_otu_count <- suppressWarnings(as.numeric(params$redundant_otu_count))
+if (length(redundant_otu_count) == 0 || is.na(redundant_otu_count)) redundant_otu_count <- 0
 
 # set working directory
 setwd(wd)
@@ -54,6 +57,7 @@ num.records <- prettyNum(num.records, big.mark=",", preserve.width="none")
 count <- prettyNum(count, big.mark=",", preserve.width="none")
 bin_count <- prettyNum(bin_count, big.mark=",", preserve.width="none")
 bin_inel_count <- prettyNum(bin_inel_count, big.mark=",", preserve.width="none")
+redundant_otu_count <- prettyNum(redundant_otu_count, big.mark=",", preserve.width="none")
 
 # calculate stats
 record.list <- sapply(strsplit(names(input.fasta), "\\|"), "[", 2)
@@ -327,7 +331,7 @@ chordata_tax <- temp_tax %>%
 # define broad categories based on class
 chordata_tax <- chordata_tax %>%
   mutate(category = case_when(
-    class %in% c("Actinopterygii", "Chondrichthyes", "Sarcopterygii") ~ "Fish",
+    class %in% c("Teleostei", "Elasmobranchii", "Dipneusti") ~ "Fish",
     class == "Aves" ~ "Birds",
     class == "Mammalia" ~ "Mammals",
     class %in% c("Reptilia", "Amphibia") ~ "Reptiles/Amphibians",
@@ -402,6 +406,7 @@ plot.verts <- ggplot(df_summary_category, aes(x = category, y = total_records, f
   - **Number of records assigned to an OTU**: `r num.records.otus`
     - **Number of unique OTUs**: `r num.unique.otus`
     - **Mean records per OTU**: `r mean.records.per.otu`
+    - **OTU reps removed as redundant with a BIN**: `r redundant_otu_count`
   - **Number of public records**: `r num.public.records`
   - **Number of anonymized private records**: `r num.private.records`
   
