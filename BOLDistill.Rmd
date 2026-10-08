@@ -12,6 +12,9 @@ params:
   bin_count: ""
   bin_inel_count: ""
   redundant_otu_count: ""
+  marker: "COI"
+  otu_threshold: "0.977"
+  use_bins: "true"
 geometry: margin=1in
 fontsize: 11pt
 header-includes:
@@ -42,6 +45,9 @@ bin_count <- as.numeric(params$bin_count)
 bin_inel_count <- as.numeric(params$bin_inel_count)
 redundant_otu_count <- suppressWarnings(as.numeric(params$redundant_otu_count))
 if (length(redundant_otu_count) == 0 || is.na(redundant_otu_count)) redundant_otu_count <- 0
+marker <- params$marker
+otu_threshold <- params$otu_threshold
+use_bins <- tolower(params$use_bins) != "false"
 
 # set working directory
 setwd(wd)
@@ -389,27 +395,42 @@ plot.verts <- ggplot(df_summary_category, aes(x = category, y = total_records, f
 # Version Details:
 - **Name**: `r filename`
 - **Date**: `r report_date`
+- **Marker**: `r marker`
 - **Divergence Threshold**: `r threshold`
+- **OTU Clustering Threshold**: `r paste0(round((1 - as.numeric(otu_threshold)) * 100, 2), "%")`
 
 # Summary of records:
 
-- **Count of records before BOLDistillation**: `r count`
-  - **Assigned to a BIN**: `r bin_count`
-  - **BIN-ineligible:**: `r bin_inel_count`
-  
-- **Count of records after BOLDistillation**: `r paste0(num.records, " (", compression, "% reduction)")`
-  - **Number of records assigned to a BIN**: `r num.records.bins`
-    - **Number of unique BINs**: `r num.unique.bins`
-      - **Number of private BINs**: `r num.private.bins`
-      - **Number of public BINs**: `r num.public.bins`
-    - **Mean records per BIN**: `r mean.records.per.bin`
-  - **Number of records assigned to an OTU**: `r num.records.otus`
-    - **Number of unique OTUs**: `r num.unique.otus`
-    - **Mean records per OTU**: `r mean.records.per.otu`
-    - **OTU reps removed as redundant with a BIN**: `r redundant_otu_count`
-  - **Number of public records**: `r num.public.records`
-  - **Number of anonymized private records**: `r num.private.records`
-  
+```{r, echo=FALSE, results="asis"}
+# BIN lines are only meaningful for markers that BOLD assigns BINs to (e.g. COI-5P)
+if (use_bins) {
+  cat(paste0(
+"- **Count of records before BOLDistillation**: ", count, "\n",
+"  - **Assigned to a BIN**: ", bin_count, "\n",
+"  - **BIN-ineligible:**: ", bin_inel_count, "\n\n",
+"- **Count of records after BOLDistillation**: ", num.records, " (", compression, "% reduction)\n",
+"  - **Number of records assigned to a BIN**: ", num.records.bins, "\n",
+"    - **Number of unique BINs**: ", num.unique.bins, "\n",
+"      - **Number of private BINs**: ", num.private.bins, "\n",
+"      - **Number of public BINs**: ", num.public.bins, "\n",
+"    - **Mean records per BIN**: ", mean.records.per.bin, "\n",
+"  - **Number of records assigned to an OTU**: ", num.records.otus, "\n",
+"    - **Number of unique OTUs**: ", num.unique.otus, "\n",
+"    - **Mean records per OTU**: ", mean.records.per.otu, "\n",
+"    - **OTU reps removed as redundant with a BIN**: ", redundant_otu_count, "\n",
+"  - **Number of public records**: ", num.public.records, "\n",
+"  - **Number of anonymized private records**: ", num.private.records, "\n\n"))
+} else {
+  cat(paste0(
+"- **Count of records before BOLDistillation**: ", count, " (all clustered into OTUs; BOLD does not assign BINs to ", marker, ")\n\n",
+"- **Count of records after BOLDistillation**: ", num.records, " (", compression, "% reduction)\n",
+"  - **Number of unique OTUs**: ", num.unique.otus, "\n",
+"  - **Mean records per OTU**: ", mean.records.per.otu, "\n",
+"  - **Number of public records**: ", num.public.records, "\n",
+"  - **Number of anonymized private records**: ", num.private.records, "\n\n"))
+}
+```
+
 # Summary of taxonomic composition:
 
 - **Number of records identified to kingdom**: `r num.id.to.kingdom`
@@ -420,23 +441,23 @@ plot.verts <- ggplot(df_summary_category, aes(x = category, y = total_records, f
 - **Number of records identified to genus**: `r num.id.to.genus`
 - **Number of records identified to species**: `r num.id.to.species`
 
-```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.cap="Number of BOLDistilled records belonging to each kingdom."}
+```{r, echo=FALSE, warning=FALSE, message=FALSE, eval=sum(df_summary$total_records) > 0, fig.cap="Number of BOLDistilled records belonging to each kingdom."}
 print(plot.k)
 ```
 
-```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.cap="Number of BOLDistilled records belonging to each phylum."}
+```{r, echo=FALSE, warning=FALSE, message=FALSE, eval=sum(df_summary_phylum$total_records) > 0, fig.cap="Number of BOLDistilled records belonging to each phylum."}
 print(plot.p)
 ```
 
-```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.cap="Number of BOLDistilled records belonging to each arthropod order."}
+```{r, echo=FALSE, warning=FALSE, message=FALSE, eval=sum(df_summary_order$total_records) > 0, fig.cap="Number of BOLDistilled records belonging to each arthropod order."}
 print(plot.oa)
 ```
 
-```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.cap="Number of BOLDistilled records belonging to each vertebrate order."}
+```{r, echo=FALSE, warning=FALSE, message=FALSE, eval=sum(df_summary_order_chordata$total_records) > 0, fig.cap="Number of BOLDistilled records belonging to each vertebrate order."}
 print(plot.oc)
 ```
 
-```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.cap="Number of BOLDistilled records belonging to common vertebrate groups."}
+```{r, echo=FALSE, warning=FALSE, message=FALSE, eval=sum(df_summary_category$total_records) > 0, fig.cap="Number of BOLDistilled records belonging to common vertebrate groups."}
 print(plot.verts)
 ```
 

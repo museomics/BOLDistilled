@@ -16,6 +16,8 @@ library(duckdb)
 args <- commandArgs(trailingOnly = TRUE)
 fasta_file <- args[1]
 wd <- args[2]
+# 3rd argument: does the marker preset use BOLD BINs? (default TRUE keeps the original COI behaviour)
+use_bins <- if (length(args) >= 3) tolower(args[3]) == "true" else TRUE
 setwd(wd)
 
 # taxonomy columns required for the consensus step (everything else is ignored)
@@ -56,9 +58,14 @@ df <- setDT(dbGetQuery(con, sprintf(
   tax_cols_sql, read_tsv_sql("combined_boldlist.tsv"))))
 
 # reduce boldlist to only records with BINs, taxonomy columns only
-boldlist_w_bins <- setDT(dbGetQuery(con, sprintf(
-  "SELECT %s FROM %s WHERE bin LIKE '%%BOLD:%%'",
-  tax_cols_sql, read_tsv_sql(boldlist_file))))
+# (skipped for markers without BINs: the library holds only OTUs, so BIN consensus would be wasted work)
+if (use_bins) {
+  boldlist_w_bins <- setDT(dbGetQuery(con, sprintf(
+    "SELECT %s FROM %s WHERE bin LIKE '%%BOLD:%%'",
+    tax_cols_sql, read_tsv_sql(boldlist_file))))
+} else {
+  boldlist_w_bins <- df[0]
+}
 
 # merge OTUs and BINs into one table
 merged <- rbind(boldlist_w_bins, df)

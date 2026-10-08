@@ -7,12 +7,17 @@
 # Usage:
 #       BOLDistill.sh        # then answer the interactive prompts:
 #                            #   1) library type: Public or Internal
-#                            #   2) library date (e.g., May2026)
+#                            #   2) marker preset (one per file in markers/, e.g. COI-5P, rbcL)
+#                            #   3) library date (e.g., May2026)
 #       Input is read from, and all output written to, the working directory set below (~/REFS).
 
 # Input files (in the working directory):
 #       1) boldlist.tsv.zip
 #       2) whitelist.txt   (public mode only — processIDs of private records allowed into public libraries)
+
+# Marker presets (markers/<name>.conf next to this script) set the marker filter, length/N limits, which
+# records are clustered into OTUs, and the OTU / distillation / OTU-dedup identity thresholds. To support
+# a new marker, copy an existing preset and edit it; no changes to this script are needed.
 
 # N.B. This script distills the entire BOLD snapshot from scratch on every run (no BINs are carried forward
 #      from a previous BOLDistilled library). Previous library folders are left in place in the working
@@ -42,6 +47,12 @@ for _sub in BOLDistill.R BOLDistill.Rmd BOLDistill_sintax.py; do
     [[ -f "$script_dir/$_sub" ]] || { echo "FATAL: cannot find $_sub in $script_dir" >&2; exit 1; }
 done
 
+marker_dir="$script_dir/markers"
+shopt -s nullglob
+marker_presets=("$marker_dir"/*.conf)
+shopt -u nullglob
+[[ ${#marker_presets[@]} -gt 0 ]] || { echo "FATAL: no marker presets (*.conf) found in $marker_dir" >&2; exit 1; }
+
 # set the working directory (input is read from here and all output is written here)
 wd="$HOME/REFS"
 cd "$wd" || { echo "Cannot enter working directory: $wd" >&2; exit 1; }
@@ -64,6 +75,35 @@ case "$mode_choice" in
     *) echo "Invalid choice; please run again and enter 1 or 2." >&2; exit 1 ;;
 esac
 
+# prompt for marker preset
+echo "Select marker:"
+for _i in "${!marker_presets[@]}"; do
+    echo "  $((_i + 1))) $(basename "${marker_presets[$_i]}" .conf)"
+done
+read -rp "Enter choice [1-${#marker_presets[@]}]: " marker_choice
+if ! [[ "$marker_choice" =~ ^[0-9]+$ ]] || (( marker_choice < 1 || marker_choice > ${#marker_presets[@]} )); then
+    echo "Invalid choice; please run again and enter a number from the list." >&2
+    exit 1
+fi
+marker_preset="${marker_presets[$((marker_choice - 1))]}"
+
+# load and validate the preset
+MARKER_LABEL=""; MARKER_CODES=""; USE_BINS=""; LENGTH_COL=""; MIN_LENGTH=""; MAX_LENGTH=""
+MAX_N=""; OTU_MAX_N=""; OTU_KINGDOMS=""; OTU_PHYLA=""; OTU_ID=""; DISTILL_ID=""; OTU_DEDUP_ID=""
+# shellcheck source=/dev/null
+source "$marker_preset"
+for _v in MARKER_LABEL MARKER_CODES USE_BINS MIN_LENGTH MAX_LENGTH MAX_N OTU_ID DISTILL_ID OTU_DEDUP_ID; do
+    [[ -n "${!_v}" ]] || { echo "FATAL: $_v is not set in $marker_preset" >&2; exit 1; }
+done
+[[ "$USE_BINS" == true || "$USE_BINS" == false ]] || { echo "FATAL: USE_BINS must be true or false in $marker_preset" >&2; exit 1; }
+for _v in OTU_ID DISTILL_ID OTU_DEDUP_ID; do
+    [[ $(echo "${!_v} > 0 && ${!_v} <= 1" | bc) -eq 1 ]] || { echo "FATAL: $_v must be between 0 and 1 in $marker_preset" >&2; exit 1; }
+done
+if [[ $(echo "$DISTILL_ID <= $OTU_ID" | bc) -eq 1 ]]; then
+    echo "WARNING: DISTILL_ID ($DISTILL_ID) is not stricter than OTU_ID ($OTU_ID); distillation will reduce most OTUs to a single sequence." >&2
+fi
+echo "Marker preset: $(basename "$marker_preset") (OTU clustering $OTU_ID, distillation $DISTILL_ID, BINs used: $USE_BINS)"
+
 # prompt for library date (e.g., May2026)
 read -rp "Enter library date (e.g., May2026): " library_date
 if [[ -z "$library_date" ]]; then
@@ -81,7 +121,7 @@ fi
 # initialize shared variables
 cores=$(nproc)
 report_date=$(date +"%d-%b-%Y")
-threshold=0.9925
+threshold=$DISTILL_ID
 divergence_threshold=$(printf "%.2f%%" "$(echo "scale=4; (1 - $threshold) * 100" | bc)")
 boldlistname=$(printf "boldlist_INPUT_%s.tsv" "$library_date")  # e.g., boldlist_INPUT_May2026.tsv
 
@@ -150,66 +190,75 @@ NR == 1 {
     print;
 }' boldlist.tsv > boldlist_cleaned.tsv
 
-# extract records that are COI-5P, have a BIN, and a sequence >= 500 bp, no more than 6 Ns, and are not flagged
-# "not flagged" tests all three BOLD flag columns: filtered='t' and stopcodon='t' mark bad records,
-# and contaminant holds a numeric code when flagged (blank when clean)
-awk -F'\t' 'BEGIN {IGNORECASE=1}
-NR==1 {
-    for (i=1; i<=NF; i++) {
-        if ($i=="marker_code") marker_col=i;
-        if ($i=="bin") bin_col=i;
-        if ($i=="nuc") nuc_col=i;
-        if ($i=="coi_length") length_col=i;
-        if ($i=="filtered") flag_col=i;
-        if ($i=="stopcodon") stop_col=i;
-        if ($i=="contaminant") cont_col=i;
-    }
-    print; next;
+# Record filters are driven by the marker preset. Both passes share the same column lookup and checks:
+#   - marker_code is one of MARKER_CODES (case-insensitive)
+#   - sequence present and length >= MIN_LENGTH (from LENGTH_COL, or the cleaned sequence when unset)
+#   - not flagged: filtered='t' and stopcodon='t' mark bad records, and contaminant holds a numeric
+#     code when flagged (blank when clean). A flag column missing from the boldlist is not tested.
+filter_awk_common='
+BEGIN {
+    n = split(tolower(marker_codes), m, " "); for (i=1; i<=n; i++) want_marker[m[i]]
+    nk = split(otu_kingdoms, k, " ");        for (i=1; i<=nk; i++) want_kingdom[k[i]]
+    np = split(otu_phyla, p, " ");           for (i=1; i<=np; i++) want_phylum[p[i]]
 }
-{
-    seq_copy = $nuc_col                  # copy sequence
-    n_count = gsub(/N/, "", seq_copy)    # count Ns without changing original
-
-    if ($marker_col=="COI-5P" &&
-        $bin_col!="" &&
-        $nuc_col!="" &&
-        $length_col>=500 &&
-        $flag_col!="t" &&
-        $stop_col!="t" &&
-        $cont_col ~ /^[[:space:]]*$/ &&
-        n_count<=6) {
-        print
-    }
-}' boldlist_cleaned.tsv > boldlist_with_bins.tsv
-
-# extract sequences (as fasta file) that belong to Bacteria, Fungi, Protista, Nematoda, are COI-5P, are >= 500 bp and <= 1600 bp, do not have BINs, and are not flagged
-# (not flagged = filtered!='t' AND stopcodon!='t' AND contaminant blank)
-awk -F'\t' 'NR == 1 {
+NR == 1 {
     for (i=1; i<=NF; i++) {
-        if ($i == "marker_code") marker_col = i;
-        if ($i == "bin") bin_col = i;
-        if ($i == "nuc") nuc_col = i;
-        if ($i == "coi_length") length_col = i;
-        if ($i == "phylum") phylum_col = i;
-        if ($i == "kingdom") kingdom_col = i;
-        if ($i == "processid") processid_col = i;
-        if ($i == "filtered") flag_col = i;
-        if ($i == "stopcodon") stop_col = i;
-        if ($i == "contaminant") cont_col = i;
+        if ($i == "marker_code") marker_col = i
+        if ($i == "bin") bin_col = i
+        if ($i == "nuc") nuc_col = i
+        if (length_name != "" && $i == length_name) length_col = i
+        if ($i == "phylum") phylum_col = i
+        if ($i == "kingdom") kingdom_col = i
+        if ($i == "processid") processid_col = i
+        if ($i == "filtered") flag_col = i
+        if ($i == "stopcodon") stop_col = i
+        if ($i == "contaminant") cont_col = i
     }
-    next;
+    if (!marker_col || !bin_col || !nuc_col || !processid_col || !kingdom_col || !phylum_col) {
+        print "FATAL: boldlist is missing one of marker_code, bin, nuc, processid, kingdom, phylum" > "/dev/stderr"; exit 1
+    }
+    if (length_name != "" && !length_col) {
+        print "FATAL: length column \"" length_name "\" (LENGTH_COL) not found in boldlist" > "/dev/stderr"; exit 1
+    }
 }
-($marker_col == "COI-5P" && $bin_col == "" && $nuc_col != "" && $length_col >= 500 && $length_col <= 1600 &&
- $flag_col != "t" && $stop_col != "t" && $cont_col ~ /^[[:space:]]*$/ &&
- ($kingdom_col == "Bacteria" || $kingdom_col == "Fungi" || $kingdom_col == "Protista" || $phylum_col == "Nematoda")) {
-    if (processid_col != "" && nuc_col != "") {
-        print ">" $processid_col "\n" $nuc_col
-    }
-}' boldlist_cleaned.tsv > bin_ineligible_records.fasta
+function base_ok(   len) {
+    if (!(tolower($marker_col) in want_marker) || $nuc_col == "") return 0
+    if (flag_col && tolower($flag_col) == "t") return 0
+    if (stop_col && tolower($stop_col) == "t") return 0
+    if (cont_col && $cont_col !~ /^[[:space:]]*$/) return 0
+    len = length_col ? $length_col : length($nuc_col)
+    seq_len = len + 0
+    return (seq_len >= min_len)
+}
+function n_count(   s) { s = $nuc_col; return gsub(/[Nn]/, "", s) }
+function otu_taxon_ok() { return (nk == 0 && np == 0) || ($kingdom_col in want_kingdom) || ($phylum_col in want_phylum) }
+'
+filter_vars=(-v marker_codes="$MARKER_CODES" -v otu_kingdoms="$OTU_KINGDOMS" -v otu_phyla="$OTU_PHYLA"
+             -v length_name="$LENGTH_COL" -v min_len="$MIN_LENGTH" -v max_len="$MAX_LENGTH"
+             -v max_n="$MAX_N" -v otu_max_n="$OTU_MAX_N" -v use_bins="$USE_BINS")
+
+# records grouped by their BOLD BIN: have a BIN, pass the shared checks, and have <= MAX_N Ns
+# (with USE_BINS=false this writes the header only and every record goes down the OTU path below)
+gawk -F'\t' "${filter_vars[@]}" "$filter_awk_common"'
+NR == 1 { print; next }
+use_bins == "true" && $bin_col != "" && base_ok() && n_count() <= max_n { print }
+' boldlist_cleaned.tsv > boldlist_with_bins.tsv || exit 1
+
+# records clustered into OTUs (as FASTA): pass the shared checks, length <= MAX_LENGTH, <= OTU_MAX_N Ns
+# (if set), kingdom/phylum in OTU_KINGDOMS/OTU_PHYLA (if set), and either have no BIN or USE_BINS=false
+gawk -F'\t' "${filter_vars[@]}" "$filter_awk_common"'
+NR == 1 { next }
+(use_bins != "true" || $bin_col == "") && base_ok() && seq_len <= max_len &&
+ (otu_max_n == "" || n_count() <= otu_max_n) && otu_taxon_ok() {
+    print ">" $processid_col "\n" $nuc_col
+}' boldlist_cleaned.tsv > bin_ineligible_records.fasta || exit 1
+
+[[ -s boldlist_with_bins.tsv && $(wc -l < boldlist_with_bins.tsv) -gt 1 || -s bin_ineligible_records.fasta ]] \
+    || { echo "FATAL: no records passed the $MARKER_LABEL filters (check MARKER_CODES in $marker_preset)" >&2; exit 1; }
 
 # cluster BIN-ineligible records into OTUs
 vsearch --cluster_fast bin_ineligible_records.fasta \
-    --id 0.977 \
+    --id "$OTU_ID" \
     --uc bin_ineligible_records_table.tsv \
     --iddef 3 \
     --threads $((cores - 10))
@@ -232,7 +281,10 @@ END {
 }' bin_ineligible_records_table.tsv > otu_map.tsv
 
 # extract bin-ineligible records from cleaned BOLDlist and add OTU names in place of BINs
-awk -F'\t' 'BEGIN { OFS="\t"
+# (matched on processid AND marker, so another marker's row for the same processid is not pulled in;
+#  the OTU name always replaces the bin field, which also discards any BIN when USE_BINS=false)
+awk -F'\t' -v marker_codes="$MARKER_CODES" 'BEGIN { OFS="\t"
+    n = split(tolower(marker_codes), m, " "); for (i=1; i<=n; i++) want_marker[m[i]]
     # Load lookup table into an array
     while ((getline < "otu_map.tsv") > 0) {
         map[$1] = $2
@@ -243,14 +295,14 @@ NR == 1 {
     for (i=1; i<=NF; i++) {
         if ($i == "processid") processid_col = i
         if ($i == "bin") bin_col = i
+        if ($i == "marker_code") marker_col = i
+        if ($i == "nuc") nuc_col = i
     }
     print
     next
 }
-($processid_col in map) {
-    if ($bin_col == "") {
-        $bin_col = map[$processid_col]
-    }
+($processid_col in map) && (tolower($marker_col) in want_marker) && $nuc_col != "" {
+    $bin_col = map[$processid_col]
     print
 }' boldlist_cleaned.tsv > boldlist_with_bin-ineligible_records.tsv
 
@@ -459,7 +511,7 @@ awk -F'\t' -v pid_col="$pid_col" 'NR==FNR {keep[$1]; next} FNR==1 || ($pid_col i
 { head -n 1 boldlist_singletons.tsv; tail -n +2 boldlist_singletons.tsv; tail -n +2 boldlist_multiples_filtered.tsv; } > temp_bins.tsv
 
 # generate final file name and rename final TSV file
-filename=$(printf "BOLDistilled_COI_%s" "$current_date")
+filename=$(printf "BOLDistilled_%s_%s" "$MARKER_LABEL" "$current_date")
 mv temp_bins.tsv "$filename".tsv
 
 ###############################################################################
@@ -482,7 +534,7 @@ mv temp_bins.tsv "$filename".tsv
 # far better explained by contamination than by novel diversity. A stricter 97.7% (BIN-level)
 # cutoff was tried and demonstrably leaked vertebrate contamination: 16 full-length Nematoda-
 # labelled reps sat at 95.0-97.5% identity to the human BIN (NUMT-like), surviving the filter.
-otu_dedup_id=0.95   # main tuning knob
+otu_dedup_id=$OTU_DEDUP_ID   # main tuning knob (set per marker in markers/*.conf)
 
 pid_c=$(head -1 "$filename".tsv | tr '\t' '\n' | grep -nxF processid | cut -d: -f1)
 bin_dc=$(head -1 "$filename".tsv | tr '\t' '\n' | grep -nxF bin       | cut -d: -f1)
@@ -499,7 +551,8 @@ awk -F'\t' -v p="$pid_c" -v b="$bin_dc" -v n="$nuc_dc" '
 touch bin_reps.fasta otu_reps.fasta
 
 # find OTU reps that already belong to an existing BIN
-if [[ -s otu_reps.fasta && -s bin_reps.fasta ]]; then
+# (skipped when the preset has USE_BINS=false: there are no BIN reps to screen against)
+if [[ "$USE_BINS" == true && -s otu_reps.fasta && -s bin_reps.fasta ]]; then
     vsearch --usearch_global otu_reps.fasta \
         --db bin_reps.fasta \
         --id "$otu_dedup_id" \
@@ -559,7 +612,7 @@ NR == 1 {
 fasta_file_name="$filename"_SEQUENCES.fasta
 
 # determine best taxonomic hierarchy for each BIN or other kingdoms without BINs,and output table for later use
-Rscript "$script_dir/BOLDistill.R" "$fasta_file_name" "$wd"
+Rscript "$script_dir/BOLDistill.R" "$fasta_file_name" "$wd" "$USE_BINS"
 
 # generate summary report
 Rscript -e "rmarkdown::render(
@@ -573,7 +626,10 @@ Rscript -e "rmarkdown::render(
     count = '${original_records_count}',
     bin_count = '${original_records_with_bins_count}',
     bin_inel_count = '${original_records_with_bin_ineligible_count}',
-    redundant_otu_count = '${redundant_otu_count}'
+    redundant_otu_count = '${redundant_otu_count}',
+    marker = '${MARKER_LABEL}',
+    otu_threshold = '${OTU_ID}',
+    use_bins = '${USE_BINS}'
   ),
   clean = TRUE)"
 
